@@ -11,16 +11,26 @@
 
 use strict;
 use warnings;
-use List::MoreUtils qw( apply );
 use File::Temp qw(tempfile);
-use JSON::Parse qw/parse_json parse_json_safe/;
+use JSON::PP;
 use Data::Dumper;
 use POSIX ":sys_wait_h"; # for nonblocking read
 use Time::HiRes qw (sleep);
 use Cwd;
 use Errno qw(EINTR);
 use Fcntl qw(:DEFAULT :flock :seek :Fcompat);
-use File::FcntlLock;
+
+# TrueNAS SCALE's sealed root fs has no compiler and no apt, so the
+# XS modules the upstream code used (JSON::Parse, File::FcntlLock,
+# List::MoreUtils) can't be installed.  JSON::PP is core perl and
+# does the same job: return the parsed structure, or undef on any
+# parse error, without dying.
+sub parse_json_safe {
+  my ($json) = (@_);
+  return undef if !defined $json or $json eq "";
+  my $ref = eval { JSON::PP->new->decode($json) };
+  return $ref;
+}
 
 my $static_speed_low;
 my $static_speed_high;   # This is the speed value at 100% demand
@@ -66,6 +76,9 @@ my $megasascli_poll_interval=300;
 # Raid controller is less expensive to poll, but also should't change
 # overly rapidly (but it doesn't have a huge heatsink, so don't be too slow)
 my $raid_controller_poll_interval=60;
+# nvidia-smi takes a fraction of a second and GPUs (especially a
+# passive Tesla) can heat up fast under load, so poll reasonably often
+my $gpu_poll_interval=10;
 # Every 60 seconds, invalidate the cache of the slowly changing
 # ambient temperatures to allow them to be refreshed
 my $ambient_poll_interval=60;
@@ -337,49 +350,32 @@ sub hddtemp {
 
 sub lock {
   my ($fh, $name)=(@_);
-  # We have to use fcntl() rather than the easier to use flock,
-  # because the filedescriptors come from our parent, and all users of
-  # the same file descriptor share the same flock locks.  If this
-  # didn't work, you'd simply revert back to flock, but get each child
-  # to reopen the tempfile as a new filehandle only they have
-
-  # Define the flock structure (l_type, l_whence, l_start, l_len, l_pid)
-  # F_WRLCK: Exclusive Write Lock
-  # SEEK_SET: Start from beginning
-  # 0, 0: Offset 0, Length 0 means entire file regardless of how much it grows
-  my $fs = new File::FcntlLock;
-  $fs->l_type( F_WRLCK );
-  $fs->l_whence( SEEK_SET );
-  $fs->l_start( 0 );
-
-  # Apply the lock (blocks until available)
-  my $result;
+  # Upstream used fcntl() locks via File::FcntlLock because its
+  # children inherited the parent's filehandles, and processes sharing
+  # one file description share flock() locks.  File::FcntlLock is an
+  # XS module we can't install on TrueNAS SCALE, so we take the
+  # author's own documented fallback: plain flock(), made safe by
+  # every child re-opening the cache files after fork (see the fork
+  # loop below), so each process has its own file description.
   my $blocked;
-  # print STDERR "fan$fans: ";
   while (1) {
-    # print STDERR "trying to lock '$name'\n";
-    $result = $fs->lock( $fh, F_SETLKW );
-    if (!$result) {
-      if ($! == EINTR) {
-        # This thread gets SIGUSR1 once per minute from
-        # wait_and_poll_output_handlers, which will interrupt us if
-        # we're locked
-
-        if ($blocked) {
-          # if blocked for more than 1 minute, warn
-          print STDERR "fan$fans: Still can't lock '$name': $fs->error\n";
-        }
-        $blocked=1;
-        next;
-      }
-      # print STDERR "fan$fans: lock, result=$result, !=$!\n";
-      die "Cannot lock file '$name': $fs->error";
-    } else {
+    if (flock($fh, LOCK_EX)) {
       last;
     }
-  };
+    if ($! == EINTR) {
+      # This thread gets SIGUSR1 once per minute from
+      # wait_and_poll_output_handlers, which will interrupt us if
+      # we're locked
+      if ($blocked) {
+        # if blocked for more than 1 minute, warn
+        print STDERR "fan$fans: Still can't lock '$name': $!\n";
+      }
+      $blocked=1;
+      next;
+    }
+    die "Cannot lock file '$name': $!";
+  }
   if ($blocked) {
-    # FIXME: should print this only if still blocked from prior minute?
     print STDERR "fan$fans: locked after blocking: '$name'\n";
   }
 }
@@ -387,40 +383,8 @@ sub lock {
 sub unlock {
   my ($fh, $name)=(@_);
 
-  # reverse the lock
-  my $fs = new File::FcntlLock;
-  $fs->l_type(F_UNLCK);
-
   seek($fh, 0, SEEK_SET) or die "seek failed: '$name': $!";
-  my $result;
-  my $blocked;
-  # print STDERR "fan$fans: ";
-  while (1) {
-    # print STDERR "trying to unlock '$name'\n";
-    $result = $fs->lock( $fh, F_SETLK );
-    if (!$result) {
-      if ($! == EINTR) {
-        # This thread gets SIGUSR1 once per minute from
-        # wait_and_poll_output_handlers, which will interrupt us if
-        # we're locked
-
-        if ($blocked) {
-          # if blocked for more than 1 minute, warn
-          print STDERR "fan$fans: Still can't unlock '$name': $fs->error\n";
-        }
-        $blocked=1;
-        next;
-      }
-      # print STDERR "fan$fans: unlock, result=$result, !=$!\n";
-      die "Cannot unlock file '$name': $fs->error";
-    } else {
-      last;
-    }
-  };
-  if ($blocked) {
-    # FIXME: should print this only if still blocked from prior minute?
-    print STDERR "fan$fans: unlocked after blocking: '$name'\n";
-  }
+  flock($fh, LOCK_UN) or die "Cannot unlock file '$name': $!";
 }
 
 # When we otherwise could just use a simple pipe, but we want to
@@ -488,6 +452,36 @@ sub raid_controller_battery_temp {
   return $val;
 }
 
+# NVIDIA cards (Tesla/Quadro/GeForce) don't show up in lm-sensors, so
+# read them via nvidia-smi.  Called with a bus-id substring (eg
+# "42:00.0") it returns that card's temperature; called with no
+# argument it returns the hottest card's.  Returns undef whenever
+# nvidia-smi fails, times out, or reports a non-number - never 0 or
+# garbage - so callers treat a silent GPU the same way upstream
+# already treats his sometimes-absent passed-through GPU: it just
+# drops out of the average.
+sub nvidia_gpu_temp {
+  my ($bus_id) = (@_);
+
+  my @lines = obtain_cachable
+    ("nvidia_gpu_temp",
+     $gpu_poll_interval,
+     "timeout -k 1 30 nvidia-smi --query-gpu=pci.bus_id,temperature.gpu --format=csv,noheader,nounits");
+
+  my @temps;
+  foreach my $line (@lines) {
+    # lines look like: "00000000:42:00.0, 59"
+    my ($bus, $temp) = split /\s*,\s*/, $line;
+    next if !defined $temp or !is_num($temp);
+    if (defined $bus_id) {
+      return $temp if index($bus, $bus_id) >= 0;
+    } else {
+      push @temps, $temp;
+    }
+  }
+  return max(@temps); # undef if no match / no valid output
+}
+
 my $ambient_cache_temp = 20;
 sub ambient_temp {
   my @ambient_ipmitemps = obtain_cachable
@@ -495,8 +489,9 @@ sub ambient_temp {
      $ambient_poll_interval,
     "timeout -k 1 30 ipmitool sdr type temperature | grep '$ipmi_inlet_sensorname' | grep [0-9]");
 
-  # apply from List::MoreUtils
-  @ambient_ipmitemps = apply { s/.*\| ([^ ]*) degrees C.*/$1/ } @ambient_ipmitemps;
+  # like List::MoreUtils' apply, but with plain map so we don't need
+  # the module: transform a copy, leave $_ alone
+  @ambient_ipmitemps = map { my $t = $_; $t =~ s/.*\| ([^ ]*) degrees C.*/$1/; $t } @ambient_ipmitemps;
 
   if (@ambient_ipmitemps) {
     # ipmitool often fails - just keep using the previous result til
@@ -514,8 +509,9 @@ sub exhaust_temp {
      $exhaust_poll_interval,
      "timeout -k 1 30 ipmitool sdr type temperature | grep '$ipmi_exhaust_sensorname' | grep [0-9]");
 
-  # apply from List::MoreUtils
-  @exhaust_ipmitemps = apply { s/.*\| ([^ ]*) degrees C.*/$1/ } @exhaust_ipmitemps;
+  # like List::MoreUtils' apply, but with plain map so we don't need
+  # the module: transform a copy, leave $_ alone
+  @exhaust_ipmitemps = map { my $t = $_; $t =~ s/.*\| ([^ ]*) degrees C.*/$1/; $t } @exhaust_ipmitemps;
 
   if (@exhaust_ipmitemps) {
     # ipmitool often fails - just keep using the previous result til
@@ -855,7 +851,7 @@ $started=1;
 $SIG{TERM} = $SIG{HUP} = $SIG{INT} = \&signal_handler;
 $SIG{USR1} = \&reset_stats_handler;
 
-foreach my $cache_bucket ("idrac_control", "sensors", "megaclisas_temp", "raid_controller_temp", "raid_controller_battery_temp", "ambient_temp", "exhaust_temp") {
+foreach my $cache_bucket ("idrac_control", "sensors", "megaclisas_temp", "raid_controller_temp", "raid_controller_battery_temp", "ambient_temp", "exhaust_temp", "nvidia_gpu_temp") {
 
   ($tempfh{$cache_bucket}, $tempfilename{$cache_bucket}) =
     tempfile("poweredge-fand.$cache_bucket.XXXXX", TMPDIR => 1);
@@ -875,6 +871,18 @@ foreach my $loop_fan (@daemons) {
     #child;
     $fans=$loop_fan;
     print "Forked child $parent_pid -> $$ for fan $fans\n";
+    # Re-open every shared cache file so this child gets its own file
+    # description.  flock() locks are per file-description: if we kept
+    # the handles inherited from the parent, all children would appear
+    # to hold each other's locks and the mutual exclusion would be
+    # silently broken.
+    foreach my $cache_bucket (keys %tempfilename) {
+      close $tempfh{$cache_bucket};
+      open($tempfh{$cache_bucket}, "+<", $tempfilename{$cache_bucket})
+        or die "Cannot reopen cache file '$tempfilename{$cache_bucket}': $!";
+      select $tempfh{$cache_bucket}; $| = 1;  # make unbuffered
+    }
+    select STDOUT; $| = 1;
     last;
   } else {
     die "could not fork: #!";
@@ -902,19 +910,12 @@ while () {
   # quickly debug new curves without waiting for the restart sequence:
   include $conf_file;
 
-  my $sensors_json = obtain_cachable
-    ("sensors",
-     $cpu_poll_interval,
-     "timeout -k 1 30 sensors -j 2>/dev/null");  # discard errors, annoyingly, but we do need to suppress things like
-                                                 # "ERROR: Can't get value of subfeature fan1_input: Can't read"
-
-  if (!($sensors_ref = parse_json_safe $sensors_json)) {
-    $sensors_json =~ s/\n/\\n/g;
-    $sensors_json =  substr($sensors_json, 0, 80);
-    print STDERR "fan$fans: discarding sensors from this run: '$sensors_ref' extracted from '$sensors_json...'\n";
-    goto nextpoll;
-  };
-
+  # Check the exhaust failsafe *before* parsing sensors: if lm-sensors
+  # ever dies persistently, we can no longer servo, and the fans would
+  # otherwise sit frozen at their last manual speed with this check
+  # unreachable.  Exhaust temperature comes from ipmitool, an
+  # independent path, so a genuinely overheating machine still gets
+  # handed back to iDRAC control.
   # my $ambient_temp = ambient_temp();
   # if ($ambient_temp > $default_threshold) {
   my $exhaust_temp = exhaust_temp();
@@ -929,6 +930,19 @@ while () {
       goto nextpoll;
     }
   } else {
+    my $sensors_json = obtain_cachable
+      ("sensors",
+       $cpu_poll_interval,
+       "timeout -k 1 30 sensors -j 2>/dev/null");  # discard errors, annoyingly, but we do need to suppress things like
+                                                   # "ERROR: Can't get value of subfeature fan1_input: Can't read"
+
+    if (!($sensors_ref = parse_json_safe $sensors_json)) {
+      $sensors_json =~ s/\n/\\n/g;
+      $sensors_json =  substr($sensors_json, 0, 80);
+      print STDERR "fan$fans: discarding sensors from this run: parse failed, extracted from '$sensors_json...'\n";
+      goto nextpoll;
+    };
+
     if (!set_fans_servo()) {
       # return for next loop without resetting timers and delta change
       # if that fails
