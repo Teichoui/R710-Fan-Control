@@ -66,6 +66,15 @@ sudo systemctl daemon-reload
 sudo systemctl --now enable poweredge-fand.service
 ```
 
+For a plain bare-metal box with no GPU and no local data drives (eg a
+Proxmox host whose HBA and disks are passed through to a guest VM),
+`poweredge-fand-r710.conf` is a much simpler example: a single
+`custom_temperature_calculation` covering just CPU (and, if present,
+the boot drive) driving every fan together via all-fans mode
+(`@daemons=(0xff)`) - copy it to `/etc/poweredge-fand.conf` instead of
+the R730xd-oriented default above, and skip the hddtemp/megaclisas
+helpers entirely since there's nothing local for them to read.
+
 [Reddit discussion](https://www.reddit.com/r/homelab/comments/ed6w7y)
 
 # Installation (TrueNAS SCALE)
