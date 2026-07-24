@@ -410,12 +410,15 @@ sub obtain_cachable {
   my ($mtime) = (stat($cache_file))[9];
   die "our state file has been deleted: $!" if (!defined $mtime);
 
-  # if the file had previously been written but an error lead to
-  # there being no content, or only just opened, then we force a new
-  # generation of the output.  Otherwise, we generate the output
-  # only if the cache_interval has expired
-  if (!(-s $cache_file) or
-      (time() - $mtime >= $cache_interval)) {
+  # Regenerate only when the cache_interval has expired.  The cache
+  # files are created backdated to the epoch, so the first call always
+  # regenerates; after that, even an *empty* result (eg nvidia-smi
+  # hanging or dying without output - the redirect still freshens the
+  # mtime) stays cached until the interval expires.  Treating empty as
+  # "regenerate now" would have all six fan children serially re-run a
+  # hanging command behind this lock, stalling fan updates for minutes
+  # exactly when a failure fallback should be applied promptly.
+  if (time() - $mtime >= $cache_interval) {
     # perlfunc: open(): "Duping filehandles"
     system("$cmd > $cache_file");
     # system("echo $cache_bucket 1>&2 ; grep -H . $cache_file 1>&2");
@@ -463,10 +466,14 @@ sub raid_controller_battery_temp {
 sub nvidia_gpu_temp {
   my ($bus_id) = (@_);
 
+  # a healthy nvidia-smi answers in well under a second, so a short
+  # timeout bounds how long a hung one can hold the cache lock; a
+  # timeout means one empty (cached) result and the conf's
+  # conservative-fallback handling takes over
   my @lines = obtain_cachable
     ("nvidia_gpu_temp",
      $gpu_poll_interval,
-     "timeout -k 1 30 nvidia-smi --query-gpu=pci.bus_id,temperature.gpu --format=csv,noheader,nounits");
+     "timeout -k 1 10 nvidia-smi --query-gpu=pci.bus_id,temperature.gpu --format=csv,noheader,nounits");
 
   my @temps;
   foreach my $line (@lines) {
@@ -855,6 +862,11 @@ foreach my $cache_bucket ("idrac_control", "sensors", "megaclisas_temp", "raid_c
 
   ($tempfh{$cache_bucket}, $tempfilename{$cache_bucket}) =
     tempfile("poweredge-fand.$cache_bucket.XXXXX", TMPDIR => 1);
+
+  # backdate so obtain_cachable's mtime check always regenerates on
+  # the first call; from then on mtime alone decides freshness, which
+  # lets an empty (failed) result be cached like any other
+  utime 0, 0, $tempfilename{$cache_bucket};
 
   select $tempfh{$cache_bucket}; $| = 1;  # make unbuffered
 }
