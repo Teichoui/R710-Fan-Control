@@ -1,23 +1,9 @@
 [Unit]
 Description=Dell Poweredge Fan Control Daemon
-# Everything lives on the nvme-apps pool because TrueNAS SCALE's root
-# filesystem is sealed (no /usr/local writes) and replaced wholesale
-# on upgrades.  This unit file itself must be re-installed into
-# /etc/systemd/system by a TrueNAS post-init script after an upgrade.
-After=zfs-mount.service
-RequiresMountsFor=/mnt/nvme-apps
-# If it's crash-looping (eg someone broke the conf), stop trying and
-# leave the machine under iDRAC control rather than flapping between
-# manual and automatic mode.  These two must live in [Unit]: systemd
-# silently ignores them in [Service] and falls back to its 10s default
-# interval, which a RestartSec=10 loop can never trip.
-StartLimitIntervalSec=600
-StartLimitBurst=5
 
 [Service]
-ExecStart=/usr/bin/perl /mnt/nvme-apps/scripts/R710-Fan-Control/poweredge-fand.pl -f /mnt/nvme-apps/scripts/R710-Fan-Control/poweredge-fand.conf
+ExecStart=/usr/local/bin/poweredge-fand.pl
 Restart=on-failure
-RestartSec=10
 Type=simple
 
 [Install]

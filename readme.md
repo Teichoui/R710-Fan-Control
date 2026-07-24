@@ -68,6 +68,31 @@ sudo systemctl --now enable poweredge-fand.service
 
 [Reddit discussion](https://www.reddit.com/r/homelab/comments/ed6w7y)
 
+# Installation (TrueNAS SCALE)
+
+TrueNAS SCALE's root filesystem is sealed (no apt, no compiler, no
+`/usr/local` writes) and is replaced wholesale on upgrades, so the
+daemon runs straight out of a pool dataset instead of `/usr/local/bin`
+and uses only core-perl modules (JSON::PP, flock).  Drive temperatures
+come from the kernel `drivetemp` driver via `sensors -j`, so the
+hddtemp/megaclisas helpers aren't needed either.
+
+```
+# clone somewhere on a pool, eg /mnt/<pool>/scripts/R710-Fan-Control
+# edit poweredge-fand.conf for your hardware, and the pool path in
+# poweredge-fand-truenas.service, then:
+sudo cp poweredge-fand-truenas.service /etc/systemd/system/poweredge-fand.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now poweredge-fand
+```
+
+`/etc` is also wiped on upgrade, so register a post-init script that
+reinstalls the unit (System -> Advanced -> Init/Shutdown Scripts, or):
+
+```
+midclt call initshutdownscript.create '{"type": "COMMAND", "command": "cp /mnt/<pool>/scripts/R710-Fan-Control/poweredge-fand-truenas.service /etc/systemd/system/poweredge-fand.service && systemctl daemon-reload && systemctl enable --now poweredge-fand", "when": "POSTINIT", "enabled": true, "timeout": 60, "comment": "poweredge-fand fan control daemon"}'
+```
+
 # Possibly required modifications/tuning
 The code's configuration is in poweredge-fand.conf, which is set to
 match my *specific* R730XD's in my specific climate with my specific
