@@ -23,5 +23,4 @@ RestartSec=10
 Type=simple
 
 [Install]
-Alias=poweredge-fand.service
 WantedBy=multi-user.target
