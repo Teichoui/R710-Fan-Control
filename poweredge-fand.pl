@@ -858,7 +858,7 @@ $started=1;
 $SIG{TERM} = $SIG{HUP} = $SIG{INT} = \&signal_handler;
 $SIG{USR1} = \&reset_stats_handler;
 
-foreach my $cache_bucket ("idrac_control", "sensors", "megaclisas_temp", "raid_controller_temp", "raid_controller_battery_temp", "ambient_temp", "exhaust_temp", "nvidia_gpu_temp") {
+foreach my $cache_bucket ("idrac_control", "sensors", "megaclisas_temp", "raid_controller_temp", "raid_controller_battery_temp", "ambient_temp", "exhaust_temp", "nvidia_gpu_temp", "remote_sensors") {
 
   ($tempfh{$cache_bucket}, $tempfilename{$cache_bucket}) =
     tempfile("poweredge-fand.$cache_bucket.XXXXX", TMPDIR => 1);
